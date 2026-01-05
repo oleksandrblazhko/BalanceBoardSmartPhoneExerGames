@@ -3,8 +3,28 @@ import json
 import math
 import websockets
 import aiohttp
+import threading
+import time
+import keyboard
+import numpy as np
+import os
+import signal
+import winsound
 
 # --- Глобальні змінні та налаштування ---
+
+# Змінні для калібрування
+delta_accX = 0.0
+delta_accY = 0.0
+
+# Стан калібрування
+class CalibrationState:
+    IDLE = 0
+    CALIBRATING = 1
+    DONE = 2
+
+calibration_state = CalibrationState.IDLE
+calibration_data = []
 
 # Множина для зберігання всіх підключених клієнтів WebSocket
 CONNECTED_CLIENTS = set()
@@ -18,7 +38,7 @@ SENSOR_DATA = {
 }
 
 # URL-адреса HTTP-сервера, звідки беруться дані
-HTTP_SERVER_URL = "http://192.168.0.103:8080/get?accX&accY"
+HTTP_SERVER_URL = "http://192.168.0.100:8080/get?accX&accY"
 
 # Коефіцієнт масштабування для перетворення значень акселерометра в кути
 SCALING_FACTOR = 7.1
@@ -47,29 +67,35 @@ async def data_loop():
     Головний цикл програми: періодично запитує дані з HTTP-сервера,
     обчислює кути нахилу та транслює їх усім підключеним клієнтам.
     """
+    global calibration_state, delta_accX, delta_accY, calibration_data
+
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # Запит даних з сенсора по HTTP
                 async with session.get(HTTP_SERVER_URL) as response:
                     if response.status == 200:
                         data = await response.json()
                         accX = data.get("buffer", {}).get("accX", {}).get("buffer", [0])[0]
                         accY = data.get("buffer", {}).get("accY", {}).get("buffer", [0])[0]
 
-                        # Обчислення кутів
-                        # Обмежуємо співвідношення діапазоном [-1.0, 1.0] для коректної роботи asin
+                        if calibration_state == CalibrationState.CALIBRATING:
+                            calibration_data.append((accX, accY))
+                            continue 
+
+                        if calibration_state == CalibrationState.DONE:
+                            accX -= delta_accX
+                            accY -= delta_accY
+
                         ratio_x = clamp(accX / SCALING_FACTOR, -1.0, 1.0)
                         ratio_y = clamp(accY / SCALING_FACTOR, -1.0, 1.0)
                         
                         angle_x = math.degrees(math.asin(ratio_x))
                         angle_y = math.degrees(math.asin(ratio_y))
 
-                        # Оновлення глобального словника з даними
-                        SENSOR_DATA["accX"] = accX
-                        SENSOR_DATA["accY"] = accY
-                        SENSOR_DATA["angle_x"] = angle_x
-                        SENSOR_DATA["angle_y"] = angle_y
+                        SENSOR_DATA.update({
+                            "accX": accX, "accY": accY,
+                            "angle_x": angle_x, "angle_y": angle_y
+                        })
                     else:
                         print(f"Помилка отримання даних: HTTP {response.status}")
             except aiohttp.ClientError as e:
@@ -77,36 +103,102 @@ async def data_loop():
             except json.JSONDecodeError:
                 print("Помилка: не вдалося розкодувати JSON.")
             
-            # Трансляція даних (лише кутів) усім клієнтам
             if CONNECTED_CLIENTS:
-                angles_to_send = {
-                    "angle_x": SENSOR_DATA["angle_x"],
-                    "angle_y": SENSOR_DATA["angle_y"]
-                }
-                message = json.dumps(angles_to_send)
-                # Асинхронно надсилаємо повідомлення всім клієнтам
-                await asyncio.wait([client.send(message) for client in CONNECTED_CLIENTS])
+                message = json.dumps({"angle_x": SENSOR_DATA["angle_x"], "angle_y": SENSOR_DATA["angle_y"]})
+                # Використовуємо gather з return_exceptions=True, щоб уникнути падіння циклу,
+                # якщо один з клієнтів від'єднався.
+                await asyncio.gather(*[client.send(message) for client in CONNECTED_CLIENTS], return_exceptions=True)
             
-            # Пауза перед наступною ітерацією циклу (0.02 секунди)
             await asyncio.sleep(0.02)
 
-async def main():
+def calibration_thread():
+    """
+    Потік для виконання калібрування.
+    """
+    global calibration_state, delta_accX, delta_accY, calibration_data
+    
+    print("Режим калібрування. Тримайте смартфон у стані спокою впродовж 5 секунд")
+    calibration_data = []
+    calibration_state = CalibrationState.CALIBRATING
+    
+    for i in range(5, 0, -1):
+        print(f"{i}...")
+        if i == 1:
+            winsound.Beep(1000, 600)
+        else:
+            winsound.Beep(1000, 200)
+        time.sleep(1)
+        
+    if calibration_data:
+        accX_data, accY_data = zip(*calibration_data)
+        delta_accX = np.mean(accX_data)
+        delta_accY = np.mean(accY_data)
+        print(f"Калібрування завершено: delta_accX={delta_accX:.2f}, delta_accY={delta_accY:.2f}")
+    else:
+        print("Не вдалося отримати дані для калібрування.")
+
+    calibration_state = CalibrationState.DONE
+
+import os
+import signal
+
+def input_handler():
+    """
+    Обробник введення з клавіатури для керування програмою.
+    """
+    global calibration_state
+    
+    while True:
+        key = keyboard.read_key()
+        if key == 'c' or key == 'C':
+            if calibration_state != CalibrationState.CALIBRATING:
+                cal_thread = threading.Thread(target=calibration_thread)
+                cal_thread.start()
+        elif key == 'q' or key == 'Q':
+            print("Завершення роботи...")
+            os.kill(os.getpid(), signal.SIGINT)
+            break
+        time.sleep(0.1)
+
+
+async def main_async():
     """Основна функція, яка запускає WebSocket-сервер та цикл обробки даних."""
+    
     server = await websockets.serve(register_client, "localhost", 8767)
     data_task = asyncio.create_task(data_loop())
 
     print("WebSocket-сервер запущено на ws://localhost:8767")
+    print("Клавіші керування: C - калібрування стану спокою, Q - завершення роботи")
     
-    # Очікуємо завершення роботи сервера
-    await server.wait_closed()
-    data_task.cancel()
+    try:
+        await data_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        server.close()
+        await server.wait_closed()
+
+def main():
+    input_thread = threading.Thread(target=input_handler)
+    input_thread.daemon = True
+    input_thread.start()
+    
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        print("\nПрограму зупинено.")
+    finally:
+        tasks = asyncio.all_tasks(loop=loop)
+        for task in tasks:
+            task.cancel()
+        
+        # Збираємо всі задачі, щоб вони завершилися з CancelledError
+        group = asyncio.gather(*tasks, return_exceptions=True)
+        loop.run_until_complete(group)
+        loop.close()
 
 
 # Точка входу в програму
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nПрограму зупинено користувачем.")
-    except Exception as e:
-        print(f"Виникла неочікувана помилка: {e}")
+    main()
